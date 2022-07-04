@@ -4,7 +4,8 @@ import sys, rpyc
 from rpyc.utils.server import ThreadedServer
 from threading import Lock, Thread
 
-NNODES = 2
+NNODES = 4
+server = None
 
 class NodeService(rpyc.Service):
     def __init__(self, identifier, n):
@@ -12,27 +13,41 @@ class NodeService(rpyc.Service):
         self.x = 0
         self.n = n
         self.primary = (self.identifier == 1)
+        self.history = []
         self.lock = Lock()
 
-    def exposed_read(self):
-        return self.x
-
     # Chamado pela cópia primária durante o broadcast
-    def exposed_update(self, x):
+    def exposed_update(self, sender, x):
+        if self.primary:
+            print(f"{self.identifier}: Cópia não primária tentou fazer broadcast.")
+
         with self.lock:
             self.x = x
+            self.history.append((sender, self.x))
 
     # Chamado por uma outra cópia que quer se tornar primária
     def exposed_request_primary(self):
         with self.lock:
-            return self.primary
+            if self.primary:
+                self.primary = False
+                return True
 
     # Chamado quando a própria cópia quer atualizar a variável
     def exposed_write(self, x):
         with self.lock:
             self.become_primary()
             self.x = x
+            self.history.append((self.identifier, self.x))
             self.broadcast()
+
+    def exposed_read(self):
+        return self.x
+
+    def exposed_history(self):
+        return self.history
+
+    def exposed_primary(self):
+        return self.primary
 
     def become_primary(self):
         if not self.primary:
@@ -52,18 +67,19 @@ class NodeService(rpyc.Service):
             if identifier == self.identifier:
                 continue
             conn = rpyc.connect("127.0.0.1", 15000 + identifier)
-            conn.root.update(self.x)
+            conn.root.update(self.identifier, self.x)
             conn.close()
 
 def start_node(identifier):
-    t = ThreadedServer(NodeService(identifier, NNODES), port=15000+identifier)
-    t.start()
+    global server
+    server = ThreadedServer(NodeService(identifier, NNODES), port=15000+identifier)
+    server.start()
 
 def main():
     identifier = int(sys.argv[1])
 
-    server = Thread(target=start_node, args=(identifier,))
-    server.start()
+    thread = Thread(target=start_node, args=(identifier,))
+    thread.start()
 
     conn = rpyc.connect("127.0.0.1", 15000 + identifier)
 
@@ -79,9 +95,23 @@ def main():
             print(conn.root.read())
         elif cmd == "write":
             conn.root.write(int(arg))
+        elif cmd == "history":
+            for sender, value in conn.root.history():
+                print(f"{sender}: {value}")
+        elif cmd == "whoami":
+            print(identifier)
+        elif cmd == "primary":
+            print(conn.root.primary())
+        elif cmd in ["help", "h", "?"]:
+            print("Comandos:")
+            print("read --> Imprime valor atual de x")
+            print("write <n> -> Modifica valor de x para n")
+            print("history -> Imprime o histórico")
+            print("whoami -> Imprime o identificador da node")
+            print("primary -> Imprime true se a node é a cópia primária, false caso contrário")
         elif cmd == "exit":
-            exit()
-
+            server.close()
+            break
 
 if __name__ == "__main__":
     main()
